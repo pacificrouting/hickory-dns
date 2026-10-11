@@ -258,6 +258,10 @@ pub enum DecodeError {
         ptr: u16,
     },
 
+    /// A compression pointer in a question targets the header, which holds no names
+    #[error("compression pointer into the header in a question name")]
+    PointerIntoHeader,
+
     /// Label bytes exceeded the limit of 63
     #[error("label bytes exceed 63: {0}")]
     LabelBytesTooLong(usize),

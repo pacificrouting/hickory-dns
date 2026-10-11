@@ -292,7 +292,8 @@ mod tests {
 
     use crate::proto::op::{Header, Message, MessageType, Metadata, OpCode, Query, ResponseCode};
     use crate::proto::rr::{DNSClass, Name, RData, Record, RecordType, rdata::SOA};
-    use crate::proto::serialize::binary::{BinDecodable, BinDecoder, BinEncoder};
+    use crate::proto::serialize::binary::{BinDecodable, BinDecoder, BinEncoder, DecodeError};
+    use crate::zone_handler::{MessageRequest, Queries};
 
     use super::*;
 
@@ -499,24 +500,13 @@ mod tests {
     // 00 00 QTYPE
     // 00 00 QCLASS
     //
-    // hickory-dns fails the 2nd assert here while building the reply message
-    // (really while remembering names for pointers):
-    //
-    // pub fn slice_of(&self, start: usize, end: usize) -> &[u8] {
-    //     assert!(start < self.offset);
-    //     assert!(end <= self.buffer.len());
-    //     &self.buffer.buffer()[start..end]
-    // }
-    // The name is eight bytes long, but the current message size (after the
-    // current offset of 12) is only six, because QueriesEmitAndCount::emit()
-    // stored just the six bytes of the original encoded query:
-    //
-    //     encoder.emit_vec(self.cached_serialized)?;
+    // The query was decoded and its raw bytes echoed into the reply. The pointer `c0 00` is
+    // relative to the request, where it names the header, so in the reply it landed on the ID
+    // and the reply did not parse; 0.24.0 also panicked while remembering names for
+    // pointers. A pointer into the header has no valid target (RFC 1035 section 4.1.4),
+    // so the request is rejected as undecodable, and the FORMERR reply carries no question.
     #[test]
     fn bad_length_of_named_pointers() {
-        let mut buf = Vec::with_capacity(512);
-        let mut encoder = BinEncoder::new(&mut buf);
-
         let data: &[u8] = &[
             0x08u8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -526,13 +516,21 @@ mod tests {
 
         let mut decoder = BinDecoder::new(data);
         let header = Header::read(&mut decoder).unwrap();
-        let msg = MessageRequest::read(&mut decoder, header).unwrap();
+        assert!(matches!(
+            MessageRequest::read(&mut decoder, header),
+            Err(DecodeError::PointerIntoHeader)
+        ));
 
-        eprintln!("queries: {:?}", msg.queries.queries());
-
-        MessageResponseBuilder::new(&msg.queries, None)
-            .build_no_records(Metadata::response_from_request(&msg.metadata))
-            .destructive_emit(&mut encoder)
+        let queries = Queries::empty();
+        let (_info, buf) = MessageResponseBuilder::new(&queries, None)
+            .error_msg(&header.metadata, ResponseCode::FormErr)
+            .encode(Protocol::Udp)
             .unwrap();
+
+        let reply = Message::from_vec(&buf).expect("the reply must parse");
+        assert_eq!(reply.metadata.id, 0x0800);
+        assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+        assert!(reply.queries.is_empty());
+        assert_eq!(buf.len(), 12);
     }
 }

@@ -988,6 +988,11 @@ fn is_unrecoverable_socket_error(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::xfer::BufDnsStreamHandle;
+    use crate::proto::{
+        op::{Message, MessageType, ResponseCode},
+        rr::Name,
+    };
     use crate::zone_handler::Catalog;
     use futures_util::future;
     #[cfg(feature = "__tls")]
@@ -1056,6 +1061,130 @@ mod tests {
         assert!(
             sanitize_src_address(SocketAddr::from(([0x20, 0, 0, 0, 0, 0, 0, 0x1], 0))).is_err()
         );
+    }
+
+    /// Sends `request` through [`ServerContext::handle_request`] and returns the reply bytes.
+    async fn reply_to(request: &[u8], deny_all: bool) -> Vec<u8> {
+        let denied = if deny_all {
+            vec!["0.0.0.0/0".parse().unwrap()]
+        } else {
+            Vec::new()
+        };
+        let mut access = AccessControl::default();
+        access.insert_deny(denied);
+        let context = ServerContext {
+            handler: Catalog::new(),
+            access,
+            shutdown: CancellationToken::new(),
+        };
+
+        let src = SocketAddr::from(([192, 0, 2, 1], 5353));
+        let (handle, mut receiver) = BufDnsStreamHandle::new(src);
+        context
+            .handle_request(
+                Bytes::copy_from_slice(request),
+                src,
+                Protocol::Udp,
+                ResponseHandle::new(src, handle, Protocol::Udp),
+            )
+            .await;
+        let reply = receiver.next().await.expect("no reply was sent");
+        reply.into_parts().0
+    }
+
+    /// A query with the given raw questions (name, then type and class IN) and RD set. The ID's
+    /// first byte is below 12 so that a pointer to offset 0, which is read as a label length
+    /// there, still decodes as a name: the check under test is the only thing that rejects it.
+    fn query_with(qnames: &[&[u8]]) -> Vec<u8> {
+        let mut wire = vec![
+            0x08,
+            0x00,
+            0x01,
+            0x00,
+            0,
+            qnames.len() as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        for qname in qnames {
+            wire.extend_from_slice(qname);
+            wire.extend_from_slice(&[0, 1, 0, 1]);
+        }
+        wire
+    }
+
+    /// A pointer into the header is relative to the request, so echoing the question verbatim
+    /// made a reply that did not parse. Such a request is malformed (RFC 1035 section 4.1.4),
+    /// and gets FORMERR with no question, in any question. Access control refuses first, but
+    /// the question it would echo is dropped for the same reason.
+    #[tokio::test]
+    async fn pointer_into_header_gets_a_reply_without_question() {
+        subscribe();
+
+        let example = b"\x07example\x03com\x00";
+        let requests = [
+            query_with(&[b"\xc0\x00"]),
+            query_with(&[b"\x03www\xc0\x02"]),
+            query_with(&[example, b"\x03www\xc0\x02"]),
+        ];
+        for (deny_all, rcode) in [
+            (false, ResponseCode::FormErr),
+            (true, ResponseCode::Refused),
+        ] {
+            for request in &requests {
+                let reply = reply_to(request, deny_all).await;
+                let reply = Message::from_vec(&reply).expect("the reply must parse");
+                assert_eq!(reply.metadata.id, 0x0800);
+                assert_eq!(reply.metadata.message_type, MessageType::Response);
+                assert_eq!(reply.metadata.response_code, rcode);
+                assert!(reply.metadata.recursion_desired);
+                assert!(reply.queries.is_empty());
+                assert!(reply.answers.is_empty());
+            }
+        }
+    }
+
+    /// A second question may point at the first, which is at the same offset in the reply, so
+    /// the echo parses (a message with two questions is still answered FORMERR).
+    #[tokio::test]
+    async fn second_question_pointing_at_the_first_is_echoed() {
+        subscribe();
+
+        let request = query_with(&[b"\x07example\x03com\x00", b"\x03www\xc0\x0c"]);
+        let reply = reply_to(&request, true).await;
+        let reply = Message::from_vec(&reply).expect("the reply must parse");
+        assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        assert_eq!(reply.queries.len(), 2);
+        assert_eq!(
+            reply.queries[1].name(),
+            &Name::from_ascii("www.example.com.").unwrap()
+        );
+    }
+
+    /// Positive control: an ordinary query still has its question echoed, here in REFUSED
+    /// replies (the empty catalog has no zone; access control denies everything).
+    #[tokio::test]
+    async fn ordinary_question_is_echoed() {
+        subscribe();
+
+        let qname = b"\x03www\x07example\x03com\x00";
+        for (deny_all, rcode) in [
+            (false, ResponseCode::Refused),
+            (true, ResponseCode::Refused),
+        ] {
+            let reply = reply_to(&query_with(&[qname]), deny_all).await;
+            let reply = Message::from_vec(&reply).expect("the reply must parse");
+            assert_eq!(reply.metadata.response_code, rcode);
+            assert_eq!(reply.queries.len(), 1);
+            assert_eq!(
+                reply.queries[0].name(),
+                &Name::from_ascii("www.example.com.").unwrap()
+            );
+        }
     }
 
     #[derive(Clone)]

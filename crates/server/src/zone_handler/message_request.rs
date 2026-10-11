@@ -135,6 +135,23 @@ impl MessageRequest {
     }
 }
 
+/// Whether the wire-format name at the start of `bytes`, already validated by a successful
+/// read, ends in a compression pointer that targets the header (offsets 0 to 11).
+fn points_into_header(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(&len) = bytes.get(i) {
+        match len {
+            0 => return false,
+            len if len & 0xC0 == 0 => i += 1 + usize::from(len),
+            len => {
+                let low = bytes.get(i + 1).copied().unwrap_or(0);
+                return u16::from_be_bytes([len & 0x3F, low]) < 12;
+            }
+        }
+    }
+    false
+}
+
 /// A set of Queries with the associated serialized data
 #[derive(Debug, PartialEq, Eq)]
 pub struct Queries {
@@ -162,7 +179,17 @@ impl Queries {
         let queries_start = decoder.index();
         let mut queries = Vec::with_capacity(num_queries);
         for _ in 0..num_queries {
+            let start = decoder.index();
             queries.push(LowerQuery::read(decoder)?);
+
+            // The cached bytes are echoed into the response, and the question section starts at
+            // the same offset (12) in both. A pointer at or after that offset therefore means the
+            // same thing in the response, but one into the header would land on the ID and flags
+            // there. RFC 1035 section 4.1.4 allows a pointer only to "a prior occurrence of the
+            // same name", and the header holds none.
+            if points_into_header(decoder.slice_from(start)?) {
+                return Err(DecodeError::PointerIntoHeader);
+            }
         }
 
         let original = decoder
@@ -341,5 +368,72 @@ impl UpdateRequest for MessageRequest {
 
     fn signature(&self) -> Option<&Record<TSIG>> {
         self.signature.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `www.example.com. IN A`, without a header.
+    const QUESTION: &[u8] = b"\x03www\x07example\x03com\x00\x00\x01\x00\x01";
+
+    /// Reads `count` questions from `body`, which follows a header of zeros.
+    fn read(body: &[u8], count: usize) -> Result<Queries, DecodeError> {
+        let mut wire = vec![0u8; 12];
+        wire.extend_from_slice(body);
+        let mut decoder = BinDecoder::new(&wire);
+        decoder.read_slice(12).unwrap();
+        Queries::read(&mut decoder, count)
+    }
+
+    #[test]
+    fn plain_question_is_read_and_kept_verbatim() {
+        let queries = read(QUESTION, 1).unwrap();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries.as_bytes(), QUESTION);
+    }
+
+    #[test]
+    fn pointer_into_the_header_is_rejected() {
+        // `c0 00` is a whole name; the others follow a label. None can name anything.
+        for name in [&b"\xc0\x00"[..], b"\x03www\xc0\x02", b"\x01a\xc0\x0b"] {
+            let mut body = name.to_vec();
+            body.extend_from_slice(&[0, 1, 0, 1]);
+            assert!(
+                matches!(read(&body, 1), Err(DecodeError::PointerIntoHeader)),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn second_question_pointing_into_the_header_is_rejected() {
+        let mut body = QUESTION.to_vec();
+        body.extend_from_slice(b"\x04mail\xc0\x02\x00\x01\x00\x01");
+        assert!(matches!(
+            read(&body, 2),
+            Err(DecodeError::PointerIntoHeader)
+        ));
+    }
+
+    #[test]
+    fn second_question_compressed_against_the_first_is_kept() {
+        // "mail" and a pointer to "example.com." at offset 16
+        let mut body = QUESTION.to_vec();
+        body.extend_from_slice(b"\x04mail\xc0\x10\x00\x01\x00\x01");
+        let queries = read(&body, 2).unwrap();
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries.as_bytes(), body);
+    }
+
+    #[test]
+    fn points_into_header_follows_labels_to_the_pointer() {
+        assert!(!points_into_header(b"\x00\x00\x01\x00\x01"));
+        assert!(!points_into_header(QUESTION));
+        assert!(points_into_header(b"\xc0\x0b\x00\x01\x00\x01"));
+        assert!(!points_into_header(b"\xc0\x0c\x00\x01\x00\x01"));
+        assert!(points_into_header(b"\x01a\xc0\x00\x00\x01\x00\x01"));
+        assert!(!points_into_header(b""));
     }
 }
