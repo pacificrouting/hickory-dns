@@ -231,16 +231,47 @@ pub(crate) struct QueriesEmitAndCount<'q> {
     cached_serialized: &'q [u8],
 }
 
+/// How many of the shortest suffixes of the query name are offered for compression, besides the
+/// whole name: they cover the zone apex and the targets of NS, SOA and CNAME records.
+const SHORTEST_SUFFIXES_STORED: usize = 7;
+
 impl EmitAndCount for QueriesEmitAndCount<'_> {
     fn emit(&mut self, encoder: &mut BinEncoder<'_>) -> Result<usize, ProtoError> {
         let original_offset = encoder.offset();
         encoder.emit_vec(self.cached_serialized)?;
         if matches!(encoder.name_encoding(), NameEncoding::Compressed) && self.first_query.is_some()
         {
-            encoder.store_label_pointer(
-                original_offset,
-                original_offset + self.cached_serialized.len(),
-            )
+            // Offer label suffixes of the first query name as compression targets, the way
+            // `Name::emit` stores its own. A single entry spanning the whole cached section
+            // (name, root, type and class) would never match: `Name::emit` looks up slices that
+            // end before the root label. Only plain labels up to the root are stored; anything
+            // else (a pointer, a bad length) offers nothing.
+            let bytes = self.cached_serialized;
+            let (mut labels, mut i) = (0, 0);
+            let root = loop {
+                match bytes.get(i) {
+                    Some(0) => break Some(i),
+                    Some(&len) if len & 0xC0 == 0 && i + 1 + usize::from(len) < bytes.len() => {
+                        labels += 1;
+                        i += 1 + usize::from(len);
+                    }
+                    _ => break None,
+                }
+            };
+            if let Some(root) = root {
+                // Each stored suffix is an owned copy in a table of 64 entries, which a long
+                // name would fill: keep the whole name and the shortest suffixes, which are the
+                // ones later names (zone apex, NS, SOA and CNAME targets) share with it.
+                let (mut start, mut label) = (0, 0);
+                while start < root {
+                    if label == 0 || labels - label <= SHORTEST_SUFFIXES_STORED {
+                        encoder
+                            .store_label_pointer(original_offset + start, original_offset + root);
+                    }
+                    start += 1 + usize::from(bytes[start]);
+                    label += 1;
+                }
+            }
         }
         Ok(self.length)
     }

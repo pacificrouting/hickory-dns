@@ -290,8 +290,8 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::str::FromStr;
 
-    use crate::proto::op::{Header, Message, MessageType, Metadata, OpCode, Query};
-    use crate::proto::rr::{DNSClass, Name, RData, Record, RecordType};
+    use crate::proto::op::{Header, Message, MessageType, Metadata, OpCode, Query, ResponseCode};
+    use crate::proto::rr::{DNSClass, Name, RData, Record, RecordType, rdata::SOA};
     use crate::proto::serialize::binary::{BinDecodable, BinDecoder, BinEncoder};
 
     use super::*;
@@ -367,6 +367,86 @@ mod tests {
         assert!(response.metadata.truncation);
         assert_eq!(response.answers.len(), 0);
         assert!(response.authorities.len() > 1);
+    }
+
+    /// Names in the answer compress against the query name: the first answer's owner is a
+    /// pointer to the question (offset 12), not the name written out a second time.
+    #[test]
+    fn test_answer_names_compress_against_the_query() {
+        let name = Name::from_str("www.example.com.").unwrap();
+        let answer = Record::from_rdata(
+            name.clone(),
+            0,
+            RData::A(Ipv4Addr::new(93, 184, 215, 14).into()),
+        );
+        let request = MessageRequest::mock(
+            Metadata::new(10, MessageType::Query, OpCode::Query),
+            Query::query(name.clone(), RecordType::A),
+        );
+        let response = MessageResponseBuilder::from_message_request(&request).build(
+            Metadata::new(10, MessageType::Response, OpCode::Query),
+            iter::once(&answer),
+            [],
+            [],
+            [],
+        );
+
+        let (_info, buf) = response.encode(Protocol::Tcp).expect("failed to encode");
+        // header 12, question 17 + 4, then the answer's owner
+        assert_eq!(&buf[33..35], &[0xC0, 0x0C]);
+        // header, question, answer (pointer 2 + 10 + 4)
+        assert_eq!(buf.len(), 12 + 21 + 16);
+        let response = Message::from_vec(&buf).expect("failed to decode");
+        assert_eq!(response.answers[0].name, name);
+    }
+
+    /// A long query name must not use up the encoder's table of compression targets: with
+    /// 127 labels and no answer, the apex of the SOA that follows it still compresses, as it
+    /// would without the query name's suffixes being offered at all.
+    #[test]
+    fn test_long_query_name_still_compresses_the_apex() {
+        let apex = Name::from_str("a.b.").unwrap();
+        let name = Name::from_str(&format!("{}a.b.", "a.".repeat(125))).unwrap();
+        assert_eq!(name.num_labels(), 127);
+        assert_eq!(
+            name.len(),
+            254,
+            "255 bytes on the wire, with the root label"
+        );
+        let soa = Record::from_rdata(
+            apex.clone(),
+            60,
+            RData::SOA(SOA::new(
+                Name::from_str("ns.a.b.").unwrap(),
+                Name::from_str("h.a.b.").unwrap(),
+                1,
+                2,
+                3,
+                4,
+                5,
+            )),
+        );
+        let request = MessageRequest::mock(
+            Metadata::new(10, MessageType::Query, OpCode::Query),
+            Query::query(name.clone(), RecordType::A),
+        );
+        let mut metadata = Metadata::new(10, MessageType::Response, OpCode::Query);
+        metadata.response_code = ResponseCode::NXDomain;
+        let response = MessageResponseBuilder::from_message_request(&request).build(
+            metadata,
+            [],
+            [],
+            iter::once(&soa),
+            [],
+        );
+
+        let (_info, buf) = response.encode(Protocol::Tcp).expect("failed to encode");
+        // header, question (255 + 4), then the SOA: owner as a pointer (2), 10 bytes of type,
+        // class, TTL and length, mname `ns` and a pointer (5), rname `h` and a pointer (4) and
+        // five 32-bit numbers (20)
+        assert_eq!(buf.len(), 12 + 259 + 2 + 10 + 5 + 4 + 20);
+        let response = Message::from_vec(&buf).expect("failed to decode");
+        assert_eq!(response.authorities[0].name, apex);
     }
 
     /// A response with no OPT record answers a request that had none, so RFC 1035 section 4.2.1
