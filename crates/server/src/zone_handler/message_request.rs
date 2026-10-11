@@ -237,10 +237,29 @@ impl EmitAndCount for QueriesEmitAndCount<'_> {
         encoder.emit_vec(self.cached_serialized)?;
         if matches!(encoder.name_encoding(), NameEncoding::Compressed) && self.first_query.is_some()
         {
-            encoder.store_label_pointer(
-                original_offset,
-                original_offset + self.cached_serialized.len(),
-            )
+            // Offer each label suffix of the first query name as a compression target, the
+            // way `Name::emit` stores its own. A single entry spanning the whole cached
+            // section (name, root, type and class) would never match: `Name::emit` looks up
+            // slices that end before the root label. Only plain labels up to the root are
+            // stored; anything else (a pointer, a bad length) offers nothing.
+            let bytes = self.cached_serialized;
+            let mut starts = Vec::new();
+            let mut i = 0;
+            let root = loop {
+                match bytes.get(i) {
+                    Some(0) => break Some(i),
+                    Some(&len) if len & 0xC0 == 0 && i + 1 + usize::from(len) < bytes.len() => {
+                        starts.push(i);
+                        i += 1 + usize::from(len);
+                    }
+                    _ => break None,
+                }
+            };
+            if let Some(root) = root {
+                for start in starts {
+                    encoder.store_label_pointer(original_offset + start, original_offset + root);
+                }
+            }
         }
         Ok(self.length)
     }

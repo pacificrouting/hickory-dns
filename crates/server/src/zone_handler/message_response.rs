@@ -369,6 +369,37 @@ mod tests {
         assert!(response.authorities.len() > 1);
     }
 
+    /// Names in the answer compress against the query name: the first answer's owner is a
+    /// pointer to the question (offset 12), not the name written out a second time.
+    #[test]
+    fn test_answer_names_compress_against_the_query() {
+        let name = Name::from_str("www.example.com.").unwrap();
+        let answer = Record::from_rdata(
+            name.clone(),
+            0,
+            RData::A(Ipv4Addr::new(93, 184, 215, 14).into()),
+        );
+        let request = MessageRequest::mock(
+            Metadata::new(10, MessageType::Query, OpCode::Query),
+            Query::query(name.clone(), RecordType::A),
+        );
+        let response = MessageResponseBuilder::from_message_request(&request).build(
+            Metadata::new(10, MessageType::Response, OpCode::Query),
+            iter::once(&answer),
+            [],
+            [],
+            [],
+        );
+
+        let (_info, buf) = response.encode(Protocol::Tcp).expect("failed to encode");
+        // header 12, question 17 + 4, then the answer's owner
+        assert_eq!(&buf[33..35], &[0xC0, 0x0C]);
+        // header, question, answer (pointer 2 + 10 + 4)
+        assert_eq!(buf.len(), 12 + 21 + 16);
+        let response = Message::from_vec(&buf).expect("failed to decode");
+        assert_eq!(response.answers[0].name, name);
+    }
+
     /// A response with no OPT record answers a request that had none, so RFC 1035 section 4.2.1
     /// applies and the message may not exceed 512 bytes.
     #[test]
